@@ -1,6 +1,6 @@
 ctranslate2>=4.0,<5
 huggingface_hub>=0.13
-tokenizers==0.15.2
+tokenizers>=0.19,<0.20
 onnxruntime>=1.14,<2 
 bitsandbytes @ git+ssh://git@github.com/slope-social/bitsandbytes-CUDA12.git@cuda121-support#egg=bitsandbytes
 av>=11
