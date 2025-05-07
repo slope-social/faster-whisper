@@ -9,4 +9,4 @@ numpy>=1.23.5,<2.1
 torch>=2.0.0
 torchaudio>=2.0.0
 mamba-ssm @ git+https://github.com/state-spaces/mamba.git@v2.2.4#egg=mamba-ssm
-nemo_toolkit @ git+https://github.com/NVIDIA/NeMo.git@v1.22.0#egg=nemo_toolkit[asr]
+nemo_toolkit @ git+https://github.com/NVIDIA/NeMo.git@v2.2.1#egg=nemo_toolkit[asr]
