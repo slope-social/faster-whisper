@@ -16,8 +16,6 @@ import ctranslate2
 import numpy as np
 import tokenizers
 import torch
-from nemo.collections.asr.models import ASRModel
-from nemo.collections.asr.parts.utils.speaker_utils import get_alignment_model
 
 from tqdm import tqdm
 
@@ -32,19 +30,6 @@ from .vad import (
     get_speech_timestamps,
     merge_segments,
 )
-
-# NeMo model mapping
-NEMO_LANGUAGE_MODELS = {
-    "en": "stt_en_conformer_ctc_large",
-    "es": "stt_es_conformer_ctc_large",
-    "de": "stt_de_conformer_ctc_large",
-    "fr": "stt_fr_conformer_ctc_large",
-    "it": "stt_it_conformer_ctc_large",
-    "ru": "stt_ru_conformer_ctc_large",
-    "pl": "stt_pl_conformer_ctc_large",
-    "uk": "stt_uk_conformer_ctc_large",
-    "pt": "stt_pt_conformer_ctc_large",
-}
 
 # Define punctuation constants at module level
 PREPEND_PUNCTUATIONS = "\"'¿([{-"  # Opening punctuation marks
@@ -410,24 +395,12 @@ class WhisperModel:
         download_root: Optional[str] = None,
         local_files_only: bool = False,
         files: dict = None,
-        use_nemo_aligner: bool = True,
         **model_kwargs,
     ):
         """Initializes the Whisper model."""
         self.logger = get_logger()
         self.device = device
-        self.use_nemo_aligner = use_nemo_aligner
-        self.nemo_aligner = None
         self.nemo_model = None
-
-        # Initialize NeMo aligner if requested and available
-        if use_nemo_aligner and torch.cuda.is_available():
-            try:
-                self.logger.info("Initializing NeMo aligner...")
-                self._init_nemo_aligner()
-            except Exception as e:
-                self.logger.warning(f"Failed to initialize NeMo aligner: {str(e)}")
-                self.use_nemo_aligner = False
 
         # Initialize Whisper model
         tokenizer_bytes, preprocessor_bytes = None, None
@@ -487,202 +460,7 @@ class WhisperModel:
         )
         self.time_precision = 0.02
         self.max_length = 448
-
-    def _init_nemo_aligner(self):
-        """Initialize NeMo aligner for the current language."""
-        if not self.model.is_multilingual:
-            language = "en"
-            self.logger.info("Using English-only NeMo model for alignment")
-        else:
-            language = None  # Will be detected during transcription
-            self.logger.info("Using multilingual NeMo model for alignment")
-            
-        if language in NEMO_LANGUAGE_MODELS:
-            model_name = NEMO_LANGUAGE_MODELS[language]
-            try:
-                self.logger.info(f"Loading NeMo ASR model: {model_name}")
-                self.nemo_model = ASRModel.from_pretrained(model_name)
-                self.nemo_model = self.nemo_model.to(self.device)
-                self.logger.info("Loading NeMo alignment model...")
-                self.nemo_aligner = get_alignment_model()
-                self.logger.info(f"Successfully initialized NeMo aligner with model: {model_name}")
-            except Exception as e:
-                self.logger.error(f"Failed to initialize NeMo model {model_name}: {str(e)}")
-                self.nemo_model = None
-                self.nemo_aligner = None
-        else:
-            self.logger.warning(f"No NeMo model available for language: {language}")
-            self.nemo_model = None
-            self.nemo_aligner = None
-
-    def add_word_timestamps(
-        self,
-        segments: List[dict],
-        tokenizer: Tokenizer,
-        encoder_output: ctranslate2.StorageView,
-        num_frames: int,
-        prepend_punctuations: str,
-        append_punctuations: str,
-        last_speech_timestamp: float,
-    ) -> float:
-        """Add word timestamps using either NeMo (if available) or Whisper alignment."""
-        # Try NeMo alignment first if enabled
-        if self.use_nemo_aligner and self.nemo_aligner:
-            self.logger.info("Attempting NeMo alignment for word timestamps...")
-            try:
-                # Get audio from encoder output
-                audio = self._get_audio_from_features(encoder_output)
-                self.logger.info(f"Processing {len(segments)} segments with NeMo aligner")
-                nemo_result = self.add_word_timestamps_nemo(
-                    segments, 
-                    audio,
-                    sampling_rate=self.feature_extractor.sampling_rate
-                )
-                if nemo_result is not None:
-                    self.logger.info("Successfully used NeMo for word alignment")
-                    return nemo_result
-                else:
-                    self.logger.warning("NeMo alignment returned None, falling back to Whisper")
-            except Exception as e:
-                self.logger.warning(f"NeMo alignment failed, falling back to Whisper: {str(e)}")
-        else:
-            self.logger.info("Using Whisper alignment (NeMo not available)")
-
-        # Fall back to original Whisper alignment
-        return self._add_word_timestamps_whisper(
-            segments,
-            tokenizer,
-            encoder_output,
-            num_frames,
-            prepend_punctuations,
-            append_punctuations,
-            last_speech_timestamp,
-        )
-
-    def add_word_timestamps_nemo(
-        self,
-        segments: List[dict],
-        audio: torch.Tensor,
-        sampling_rate: int = 16000,
-    ) -> float:
-        """Add word timestamps using NeMo aligner."""
-        if not self.nemo_aligner or not self.nemo_model:
-            self.logger.warning("NeMo aligner or model not initialized")
-            return None
-            
-        try:
-            last_speech_timestamp = 0.0
-            segments_processed = 0
-            segments_aligned = 0
-            total_segments = sum(len(segment) for segment in segments)
-            
-            self.logger.info(f"Starting NeMo alignment for {total_segments} total segments")
-            
-            for segment_group in segments:
-                segments_processed += len(segment_group)
-                if not segment_group or not segment_group[0]["text"].strip():
-                    continue
-                    
-                # Extract audio segment
-                start_time = segment_group[0]["start"]
-                end_time = segment_group[-1]["end"]
-                start_sample = int(start_time * sampling_rate)
-                end_sample = int(end_time * sampling_rate)
-                segment_audio = audio[start_sample:end_sample]
-                
-                # Get alignments from NeMo
-                try:
-                    self.logger.debug(
-                        f"Processing segment group {segments_processed}/{total_segments} "
-                        f"[{start_time:.2f}s - {end_time:.2f}s] with NeMo aligner"
-                    )
-                    alignments = self.nemo_aligner.get_alignments(
-                        audio_signal=segment_audio.unsqueeze(0),
-                        text=segment_group[0]["text"]
-                    )
-                    
-                    # Convert alignments to word timestamps
-                    words = []
-                    for word, (start_idx, end_idx) in alignments.items():
-                        # Convert frame indices to time
-                        word_start = start_idx * 0.02 + start_time  # 20ms frame duration
-                        word_end = end_idx * 0.02 + start_time
-                        
-                        words.append({
-                            "word": word,
-                            "start": round(word_start, 3),
-                            "end": round(word_end, 3),
-                            "probability": 1.0  # NeMo doesn't provide confidence scores
-                        })
-                    
-                    # Update segment with word alignments
-                    segment_group[0]["words"] = words
-                    last_speech_timestamp = max(last_speech_timestamp, word_end)
-                    segments_aligned += 1
-                    
-                    self.logger.debug(
-                        f"Successfully aligned {len(words)} words in segment "
-                        f"[{start_time:.2f}s - {end_time:.2f}s]"
-                    )
-                    
-                except Exception as e:
-                    self.logger.warning(
-                        f"NeMo alignment failed for segment {segments_processed}: {str(e)}"
-                    )
-                    return None
-            
-            self.logger.info(
-                f"NeMo alignment complete - {segments_aligned}/{segments_processed} "
-                f"segments aligned successfully"
-            )
-            return last_speech_timestamp
-            
-        except Exception as e:
-            self.logger.error(f"NeMo word timestamp error: {str(e)}")
-            return None
-
-    def _add_word_timestamps_whisper(
-        self,
-        segments: List[dict],
-        tokenizer: Tokenizer,
-        encoder_output: ctranslate2.StorageView,
-        num_frames: int,
-        prepend_punctuations: str,
-        append_punctuations: str,
-        last_speech_timestamp: float,
-    ) -> float:
-        """Original Whisper word timestamp implementation."""
-        if len(segments) == 0:
-            return last_speech_timestamp
-
-        text_tokens = []
-        text_tokens_per_segment = []
-        for segment in segments:
-            segment_tokens = [
-                [token for token in subsegment["tokens"] if token < tokenizer.eot]
-                for subsegment in segment
-            ]
-            text_tokens.append(list(itertools.chain.from_iterable(segment_tokens)))
-            text_tokens_per_segment.append(segment_tokens)
-
-        alignments = self.find_alignment(
-            tokenizer, text_tokens, encoder_output, num_frames
-        )
-        
-        # Original Whisper alignment code continues here...
-        # [Original code continues unchanged]
-        return last_speech_timestamp
-
-    def _get_audio_from_features(self, encoder_output: ctranslate2.StorageView) -> torch.Tensor:
-        """Convert encoder features back to audio for NeMo alignment."""
-        # This is a placeholder - actual implementation would depend on your feature extraction
-        # You'll need to implement the inverse of your feature extraction process
-        raise NotImplementedError("Audio reconstruction from features not implemented")
-
-    @property
-    def supported_languages(self) -> List[str]:
-        """The languages supported by the model."""
-        return list(_LANGUAGE_CODES) if self.model.is_multilingual else ["en"]
+        self.cpu_threads = cpu_threads
 
     def _get_feature_kwargs(self, model_path, preprocessor_bytes=None) -> dict:
         config = {}
